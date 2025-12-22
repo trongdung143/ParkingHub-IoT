@@ -1,5 +1,5 @@
 # Database Migrations
-
+#  DÙNG SUPABASE CỦA T THÌ CHẮC KHÔNG CẦN CHẠY ĐÂU
 These SQL migration files need to be executed in Supabase SQL Editor.
 
 ## How to Run Migrations

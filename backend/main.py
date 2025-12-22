@@ -6,11 +6,31 @@ from datetime import datetime
 import uuid
 from typing import Optional
 from dotenv import load_dotenv
-
+from ultralytics import YOLO
+from PIL import Image
+import io
+from pathlib import Path
+import torch
+import numpy as np
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+import traceback #debug 
 # Load environment variables
 load_dotenv()
 
 app = FastAPI(title="IoT Smart Parking API", version="1.0.0")
+model = YOLO('model_ckpt/license-plate-finetune-v1x.pt')
+
+ocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-printed")
+ocr_model = VisionEncoderDecoderModel.from_pretrained("DunnBC22/trocr-base-printed_license_plates_ocr")
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+ocr_model = ocr_model.to(device)
+
+if device == "cuda":
+    ocr_model = ocr_model.half()
+
+ocr_model.eval()
+
 
 # CORS middleware
 app.add_middleware(
@@ -24,7 +44,7 @@ app.add_middleware(
 # Supabase configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "parking-images")
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set as environment variables")
@@ -36,16 +56,16 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 async def root():
     return {"message": "IoT Smart Parking API", "version": "1.0.0"}
 
-
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
 
-@app.post("/api/v1/esp32/upload")
+@app.post("/api/v1/esp32/in-upload")
 async def esp32_upload(
     rfid_id: str = Form(...),
-    image: UploadFile = File(...)
+    image: UploadFile = File(...),
+    parking_slot: Optional[str] = Form(None),
 ):
     """
     Endpoint for ESP32-CAM to upload RFID ID and license plate image.
@@ -64,9 +84,56 @@ async def esp32_upload(
         
         # Read image bytes
         image_bytes = await image.read()
-        
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        BASE_DIR = Path(__file__).resolve().parent
+        DATA_DIR = BASE_DIR / "data"
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+        save_path = DATA_DIR / f"{rfid_id}.jpg"
+        img.save(save_path, format="JPEG", quality=95, optimize=True)
+
+        print("Saved image to:", save_path)
+        print("Current working dir:", os.getcwd())
+
+        # detect license plate text using 
+        results = model.predict(source=str(save_path), verbose=False)
+
+        plate_text = None
+        detections_json = results[0].to_json()
+
+        boxes = results[0].boxes
+        if boxes is not None and len(boxes) > 0:
+            conf = boxes.conf.detach().cpu().numpy()
+            best_i = int(np.argmax(conf))
+
+            x1, y1, x2, y2 = boxes.xyxy[best_i].detach().cpu().tolist()
+            w, h = img.size
+
+            pad = 0.3
+            dx = int((x2 - x1) * pad)
+            dy = int((y2 - y1) * pad)
+
+            x1 = int(max(0, x1 - dx))
+            y1 = int(max(0, y1 - dy))
+            x2 = int(min(w, x2 + dx))
+            y2 = int(min(h, y2 + dy))
+
+            if x2 > x1 and y2 > y1:
+                plate_crop = img.crop((x1, y1, x2, y2))
+
+                pixel_values = ocr_processor(images=plate_crop, return_tensors="pt").pixel_values.to(device)
+                if device == "cuda":
+                    pixel_values = pixel_values.half()
+
+                with torch.inference_mode():
+                    generated_ids = ocr_model.generate(pixel_values, max_new_tokens=16, num_beams=5)
+                plate_text = ocr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                plate_text = plate_text.strip().replace(" ", "")
+
         # Generate unique filename
-        file_extension = image.filename.split(".")[-1] if "." in image.filename else "jpg"
+        original_name = image.filename or "image.jpg"
+        file_extension = original_name.split(".")[-1] if "." in original_name else "jpg"
         filename = f"{uuid.uuid4()}.{file_extension}"
         file_path = f"parking/{filename}"
         
@@ -93,13 +160,74 @@ async def esp32_upload(
         except:
             # Fallback to relative path if public URL fails
             image_path = file_path
-        
+
+        # Suggest available parking slots based on current database state
+        suggested_slot = None
+        available_slots = []
+
+        try:
+            # 1) Get all active slots from parking_slots table
+            slots_resp = supabase.table("parking_slots")\
+                .select("slot_name, is_active")\
+                .eq("is_active", True)\
+                .execute()
+
+            all_slots = [row["slot_name"] for row in (slots_resp.data or []) if row.get("slot_name")]
+
+            # 2) Scan all events chronologically to determine which slots are currently occupied
+            events_resp = supabase.table("parking_events")\
+                .select("rfid_id, parking_slot, event_type, created_at")\
+                .order("created_at", desc=False)\
+                .execute()
+
+            rfid_state = {}  # rfid_id -> {"slot": str, "status": "IN" | "OUT"}
+            for ev in events_resp.data or []:
+                slot = ev.get("parking_slot")
+                if not slot or slot == "N/A":
+                    continue
+
+                rfid = ev.get("rfid_id")
+                if not rfid:
+                    continue
+
+                event_type = ev.get("event_type") or "IN"
+
+                if event_type == "IN":
+                    # Last IN wins; this RFID is now occupying this slot
+                    rfid_state[rfid] = {"slot": slot, "status": "IN"}
+                elif event_type == "OUT":
+                    # Mark RFID as OUT (no longer occupying its last slot)
+                    if rfid in rfid_state:
+                        rfid_state[rfid]["status"] = "OUT"
+
+            # 3) Derive occupied and available slots
+            occupied_slots = {
+                state["slot"]
+                for state in rfid_state.values()
+                if state.get("status") == "IN" and state.get("slot")
+            }
+
+            available_slots = [slot for slot in all_slots if slot not in occupied_slots]
+            suggested_slot = available_slots[0] if available_slots else None
+        except Exception as slot_error:
+            # Fail gracefully if slot suggestion logic fails
+            print(f"Failed to compute available slots: {slot_error}")
+            suggested_slot = None
+            available_slots = []
+
+        # Decide which slot to save for this event:
+        #  - if client sent parking_slot, use it
+        #  - otherwise, use suggested_slot (first available)
+        slot_to_save = parking_slot or suggested_slot
+
         # Insert record into parking_events table
         event_data = {
             "id": str(uuid.uuid4()),
             "rfid_id": rfid_id,
             "image_path": image_path,
-            "created_at": datetime.utcnow().isoformat()
+            "created_at": datetime.utcnow().isoformat(),
+            "parking_slot": slot_to_save,
+            "license_plate": plate_text,
         }
         
         db_response = supabase.table("parking_events").insert(event_data).execute()
@@ -107,12 +235,18 @@ async def esp32_upload(
         if not db_response.data:
             raise HTTPException(status_code=500, detail="Failed to insert parking event")
         
-        # Return rfid_id as JSON (consistent format)
-        return {"rfid_id": rfid_id}
+        # Return rfid_id and slot suggestions as JSON
+        return {
+            "rfid_id": rfid_id,
+            "license_plate": plate_text,
+            "suggested_slot": suggested_slot,
+            "available_slots": available_slots,
+        }
         
     except HTTPException:
         raise
     except Exception as e:
+        traceback.print_exc()  #debug 
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 

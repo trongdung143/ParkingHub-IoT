@@ -3,4 +3,11 @@ uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 supabase==2.0.0
 python-dotenv==1.0.0
+ultralytics==8.3.32
+opencv-python==4.10.0.84
+numpy==1.26.4
+transformers
+torch
+torchvision
+pillow 
 

@@ -3,32 +3,25 @@
 import { useState, useEffect } from 'react'
 import DashboardLayout from '../components/DashboardLayout'
 import CameraView from '../components/CameraView'
-import CarInfo from '../components/CarInfo'
+import CarInUpload from '../components/CarInUpload'
+import CarInfo, { CarEvent } from '../components/CarInfo'
 import { Activity, Users, Clock, Camera, RefreshCw } from 'lucide-react'
 
-interface CarEvent {
-  id: string
-  rfid_id: string
-  license_plate: string | null
-  event_type: string
-  created_at: string
-  parking_slot: string | null
-}
+
 
 export default function MenuPage() {
   const [carInEvent, setCarInEvent] = useState<CarEvent | null>(null)
   const [carOutEvent, setCarOutEvent] = useState<CarEvent | null>(null)
   const [loading, setLoading] = useState(true)
 
-  // ESP32-CAM stream URLs - Update these with your actual camera IP addresses
-  const carInStreamUrl = process.env.NEXT_PUBLIC_CAR_IN_CAMERA_URL || 'http://192.168.1.100:81/stream'
+  // ESP32-CAM stream URL for CAR OUT - Update this with your actual camera IP address
   const carOutStreamUrl = process.env.NEXT_PUBLIC_CAR_OUT_CAMERA_URL || 'http://192.168.1.101:81/stream'
 
   const fetchRecentEvents = async () => {
     try {
       setLoading(true)
       const response = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/v1/parking-events?limit=10`
+        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/v1/parking-events?limit=100`
       )
       
       if (!response.ok) {
@@ -36,12 +29,13 @@ export default function MenuPage() {
       }
       
       const data = await response.json()
-      const events = data.events || []
+      const events: CarEvent[] = data.events || []
       
-      // Find most recent IN event
-      const inEvent = events.find((e: CarEvent) => 
-        e.event_type === 'IN' || e.event_type === null
-      )
+      // Find most recent IN event (treat missing event_type as 'IN')
+      const inEvent = events.find((e: CarEvent) => {
+        const t = (e as any).event_type ?? 'IN'
+        return t === 'IN'
+      })
       
       // Find most recent OUT event
       const outEvent = events.find((e: CarEvent) => 
@@ -119,12 +113,25 @@ export default function MenuPage() {
           </div>
         </div>
 
-        {/* Camera Views */}
+        {/* Camera / Upload Views */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-          <CameraView 
-            title="CAR IN" 
-            streamUrl={carInStreamUrl}
+          {/* Left side: Upload image for CAR IN */}
+          <CarInUpload
+            onUploaded={(payload) => {
+              const now = new Date().toISOString()
+              setCarInEvent({
+                id: 'local-' + now,
+                rfid_id: payload.rfid_id,
+                license_plate: payload.license_plate,
+                event_type: 'IN',
+                created_at: now,
+                parking_slot: payload.suggested_slot,
+              })
+              fetchRecentEvents()
+            }}
           />
+
+          {/* Right side: Live camera for CAR OUT */}
           <CameraView 
             title="CAR OUT" 
             streamUrl={carOutStreamUrl}

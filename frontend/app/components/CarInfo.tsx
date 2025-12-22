@@ -2,7 +2,7 @@
 
 import { CreditCard, Car, Clock } from 'lucide-react'
 
-interface CarEvent {
+export interface CarEvent {
   id: string
   rfid_id: string
   license_plate: string | null
