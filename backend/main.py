@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 import os
@@ -13,6 +13,7 @@ import traceback  # debug
 from PIL import ImageOps
 import numpy as np
 import tempfile
+import os
 from fast_alpr import ALPR
 
 # Load environment variables
@@ -25,7 +26,9 @@ app = FastAPI(title="IoT Smart Parking API", version="1.0.0")
 # We try CUDA providers first (for GTX 1650Ti). If CUDA isn't available, fall back to CPU.
 try:
     alpr = ALPR(
-        detector_model=os.getenv("FASTALPR_DETECTOR_MODEL", "yolo-v9-t-384-license-plate-end2end"),
+        detector_model=os.getenv(
+            "FASTALPR_DETECTOR_MODEL", "yolo-v9-t-384-license-plate-end2end"
+        ),
         ocr_model=os.getenv("FASTALPR_OCR_MODEL", "cct-xs-v1-global-model"),
         ocr_device=os.getenv("FASTALPR_OCR_DEVICE", "cuda"),
         detector_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
@@ -35,13 +38,14 @@ try:
 except Exception as e:
     print(f"[FastALPR] CUDA init failed, falling back to CPU. Reason: {e}")
     alpr = ALPR(
-        detector_model=os.getenv("FASTALPR_DETECTOR_MODEL", "yolo-v9-t-384-license-plate-end2end"),
-        ocr_model=os.getenv("FASTALPR_OCR_MODEL", "cct-xs-v1-global-model"),
+        detector_model="yolo-v9-t-384-license-plate-end2end",
+        ocr_model="cct-xs-v1-global-model",
         ocr_device="cpu",
         detector_providers=["CPUExecutionProvider"],
         ocr_providers=["CPUExecutionProvider"],
-        detector_conf_thresh=float(os.getenv("FASTALPR_DETECTOR_CONF", "0.4")),
+        detector_conf_thresh=0.4,
     )
+
 
 # CORS middleware
 app.add_middleware(
@@ -58,7 +62,9 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set as environment variables")
+    raise ValueError(
+        "SUPABASE_URL and SUPABASE_KEY must be set as environment variables"
+    )
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -83,13 +89,18 @@ def _pick_best_plate(alpr_results):
         ocr_conf = float(ocr_conf) if ocr_conf is not None else None
 
         # Prefer OCR confidence if available; otherwise prefer longer strings, then detection confidence
-        score = (ocr_conf * 100.0 if ocr_conf is not None else 0.0) + (len(text) * 2.0) + det_conf
+        score = (
+            (ocr_conf * 100.0 if ocr_conf is not None else 0.0)
+            + (len(text) * 2.0)
+            + det_conf
+        )
 
         if score > best_score:
             best_score = score
             best_text = text
 
     return best_text
+
 
 def fastalpr_read_plate(alpr, pil_img, saved_path_str):
     # 1) Normal prediction (path)
@@ -129,6 +140,7 @@ def fastalpr_read_plate(alpr, pil_img, saved_path_str):
 
     return None
 
+
 @app.get("/")
 async def root():
     return {"message": "IoT Smart Parking API", "version": "1.0.0"}
@@ -140,11 +152,7 @@ async def health():
 
 
 @app.post("/api/v1/esp32/in-upload")
-async def esp32_upload(
-    rfid_id: str = Form(...),
-    image: UploadFile = File(...),
-    parking_slot: Optional[str] = Form(None),
-):
+async def esp32_upload(rfid_id: str = Query(...), request: Request = None):
     """
     Endpoint for ESP32-CAM to upload RFID ID and license plate image.
 
@@ -156,12 +164,9 @@ async def esp32_upload(
         Plain text rfid_id or JSON with rfid_id
     """
     try:
-        # Validate image type
-        if not image.content_type or not image.content_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail="File must be an image")
-
+        print(f"Received upload for RFID ID: {rfid_id}")
         # Read image bytes
-        image_bytes = await image.read()
+        image_bytes = await request.body()
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
         BASE_DIR = Path(__file__).resolve().parent
@@ -180,6 +185,7 @@ async def esp32_upload(
             alpr_results = alpr.predict(str(save_path))
 
             if alpr_results:
+
                 def score(r):
                     if not r or not getattr(r, "ocr", None):
                         return -1.0
@@ -203,9 +209,11 @@ async def esp32_upload(
         except Exception as alpr_error:
             print(f"FastALPR failed: {alpr_error}")
             plate_text = None
+            return
 
         # Generate unique filename
-        original_name = image.filename or "image.jpg"
+        print("Detected plate text:", plate_text)
+        original_name = "image.jpg"
         file_extension = original_name.split(".")[-1] if "." in original_name else "jpg"
         filename = f"{uuid.uuid4()}.{file_extension}"
         file_path = f"parking/{filename}"
@@ -218,18 +226,22 @@ async def esp32_upload(
             except:
                 pass  # File doesn't exist, which is fine
 
-            storage_response = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).upload(
-                file_path,
-                image_bytes,
-                file_options={"content-type": image.content_type},
-            )
         except Exception as storage_error:
-            raise HTTPException(status_code=500, detail=f"Failed to upload image to storage: {str(storage_error)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to upload image to storage: {str(storage_error)}",
+            )
 
         # Get public URL for the image
         try:
-            public_url_response = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).get_public_url(file_path)
-            image_path = public_url_response if isinstance(public_url_response, str) else file_path
+            public_url_response = supabase.storage.from_(
+                SUPABASE_STORAGE_BUCKET
+            ).get_public_url(file_path)
+            image_path = (
+                public_url_response
+                if isinstance(public_url_response, str)
+                else file_path
+            )
         except:
             # Fallback to relative path if public URL fails
             image_path = file_path
@@ -247,7 +259,11 @@ async def esp32_upload(
                 .execute()
             )
 
-            all_slots = [row["slot_name"] for row in (slots_resp.data or []) if row.get("slot_name")]
+            all_slots = [
+                row["slot_name"]
+                for row in (slots_resp.data or [])
+                if row.get("slot_name")
+            ]
 
             # 2) Scan all events chronologically to determine which slots are currently occupied
             events_resp = (
@@ -295,7 +311,7 @@ async def esp32_upload(
         # Decide which slot to save for this event:
         #  - if client sent parking_slot, use it
         #  - otherwise, use suggested_slot (first available)
-        slot_to_save = parking_slot or suggested_slot
+        slot_to_save = suggested_slot
 
         # Insert record into parking_events table
         event_data = {
@@ -310,9 +326,12 @@ async def esp32_upload(
         db_response = supabase.table("parking_events").insert(event_data).execute()
 
         if not db_response.data:
-            raise HTTPException(status_code=500, detail="Failed to insert parking event")
+            raise HTTPException(
+                status_code=500, detail="Failed to insert parking event"
+            )
 
         # Return rfid_id and slot suggestions as JSON
+        print(suggested_slot)
         return {
             "rfid_id": rfid_id,
             "license_plate": plate_text,
@@ -327,7 +346,6 @@ async def esp32_upload(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-
 @app.get("/api/v1/parking-events")
 async def get_parking_events(limit: int = 100, offset: int = 0):
     """
@@ -335,15 +353,19 @@ async def get_parking_events(limit: int = 100, offset: int = 0):
     """
     try:
         # Supabase Python client uses .range() for pagination
-        response = supabase.table("parking_events")\
-            .select("*")\
-            .order("created_at", desc=True)\
-            .range(offset, offset + limit - 1)\
+        response = (
+            supabase.table("parking_events")
+            .select("*")
+            .order("created_at", desc=True)
+            .range(offset, offset + limit - 1)
             .execute()
-        
+        )
+
         return {"events": response.data, "count": len(response.data)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch parking events: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch parking events: {str(e)}"
+        )
 
 
 @app.get("/api/v1/parking-sessions")
@@ -357,65 +379,73 @@ async def get_parking_sessions(limit: int = 100, offset: int = 0):
         # Get more events to ensure proper session calculation
         # We need enough events to pair IN/OUT properly
         fetch_limit = max(limit * 3, 500)
-        response = supabase.table("parking_events")\
-            .select("*")\
-            .order("created_at", desc=False)\
-            .limit(fetch_limit)\
+        response = (
+            supabase.table("parking_events")
+            .select("*")
+            .order("created_at", desc=False)
+            .limit(fetch_limit)
             .execute()
-        
+        )
+
         events = response.data
-        
+
         # Group events by RFID and calculate sessions
         sessions = []
         rfid_sessions = {}  # Track last IN event for each RFID
-        
+
         # Process events in chronological order
         for event in events:
-            rfid_id = event['rfid_id']
-            event_type = event.get('event_type')
-            created_at = event['created_at']
-            
+            rfid_id = event["rfid_id"]
+            event_type = event.get("event_type")
+            created_at = event["created_at"]
+
             # Default to 'IN' if event_type is not set
             if event_type is None:
-                event_type = 'IN'
-            
-            if event_type == 'IN':
+                event_type = "IN"
+
+            if event_type == "IN":
                 # Check if there's a previous open session for this RFID
                 if rfid_id in rfid_sessions:
                     # Close the previous session (time_out = time of this new IN event)
                     prev_session = rfid_sessions[rfid_id]
-                    prev_session['time_out'] = created_at
+                    prev_session["time_out"] = created_at
                     sessions.append(prev_session)
-                
+
                 # Start new session
                 session = {
-                    'id': event['id'],
-                    'card_id': rfid_id,
-                    'license_plate': event.get('license_plate') or 'N/A',
-                    'time_in': created_at,
-                    'time_out': None,  # Will be set when next IN event or OUT event occurs
-                    'parking_slot': event.get('parking_slot') or 'N/A',
-                    'image_path': event.get('image_path', '')
+                    "id": event["id"],
+                    "card_id": rfid_id,
+                    "license_plate": event.get("license_plate") or "N/A",
+                    "time_in": created_at,
+                    "time_out": None,  # Will be set when next IN event or OUT event occurs
+                    "parking_slot": event.get("parking_slot") or "N/A",
+                    "image_path": event.get("image_path", ""),
                 }
                 rfid_sessions[rfid_id] = session
-            elif event_type == 'OUT':
+            elif event_type == "OUT":
                 # Close the current session for this RFID
                 if rfid_id in rfid_sessions:
-                    rfid_sessions[rfid_id]['time_out'] = created_at
+                    rfid_sessions[rfid_id]["time_out"] = created_at
                     sessions.append(rfid_sessions[rfid_id])
                     del rfid_sessions[rfid_id]
-        
+
         # Add any remaining open sessions (still parked)
         for session in rfid_sessions.values():
             sessions.append(session)
-        
+
         # Sort by time_in descending (most recent first) and apply pagination
-        sessions.sort(key=lambda x: x['time_in'], reverse=True)
-        paginated_sessions = sessions[offset:offset + limit]
-        
-        return {"sessions": paginated_sessions, "count": len(paginated_sessions), "total": len(sessions)}
+        sessions.sort(key=lambda x: x["time_in"], reverse=True)
+        paginated_sessions = sessions[offset : offset + limit]
+
+        return {
+            "sessions": paginated_sessions,
+            "count": len(paginated_sessions),
+            "total": len(sessions),
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch parking sessions: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch parking sessions: {str(e)}"
+        )
 
 
 @app.get("/api/v1/parking-events/{rfid_id}")
@@ -424,15 +454,19 @@ async def get_parking_events_by_rfid(rfid_id: str):
     Get parking events for a specific RFID ID.
     """
     try:
-        response = supabase.table("parking_events")\
-            .select("*")\
-            .eq("rfid_id", rfid_id)\
-            .order("created_at", desc=True)\
+        response = (
+            supabase.table("parking_events")
+            .select("*")
+            .eq("rfid_id", rfid_id)
+            .order("created_at", desc=True)
             .execute()
-        
+        )
+
         return {"events": response.data, "count": len(response.data)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch parking events: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch parking events: {str(e)}"
+        )
 
 
 @app.get("/api/v1/parking-slots")
@@ -441,23 +475,24 @@ async def get_parking_slots():
     Get all parking slots from the parking_slots table.
     """
     try:
-        response = supabase.table("parking_slots")\
-            .select("*")\
-            .order("row_letter", desc=False)\
-            .order("slot_number", desc=False)\
+        response = (
+            supabase.table("parking_slots")
+            .select("*")
+            .order("row_letter", desc=False)
+            .order("slot_number", desc=False)
             .execute()
-        
+        )
+
         return {"slots": response.data, "count": len(response.data)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch parking slots: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch parking slots: {str(e)}"
+        )
 
 
 @app.post("/api/v1/parking-slots")
 async def create_parking_slot(
-    slot_name: str,
-    row_letter: str,
-    slot_number: int,
-    is_active: bool = True
+    slot_name: str, row_letter: str, slot_number: int, is_active: bool = True
 ):
     """
     Create a new parking slot.
@@ -467,17 +502,22 @@ async def create_parking_slot(
             "slot_name": slot_name,
             "row_letter": row_letter,
             "slot_number": slot_number,
-            "is_active": is_active
+            "is_active": is_active,
         }
-        
+
         response = supabase.table("parking_slots").insert(slot_data).execute()
-        
+
         if not response.data:
             raise HTTPException(status_code=500, detail="Failed to create parking slot")
-        
-        return {"slot": response.data[0], "message": "Parking slot created successfully"}
+
+        return {
+            "slot": response.data[0],
+            "message": "Parking slot created successfully",
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create parking slot: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create parking slot: {str(e)}"
+        )
 
 
 @app.put("/api/v1/parking-slots/{slot_id}")
@@ -486,7 +526,7 @@ async def update_parking_slot(
     slot_name: Optional[str] = None,
     row_letter: Optional[str] = None,
     slot_number: Optional[int] = None,
-    is_active: Optional[bool] = None
+    is_active: Optional[bool] = None,
 ):
     """
     Update a parking slot.
@@ -501,22 +541,29 @@ async def update_parking_slot(
             update_data["slot_number"] = slot_number
         if is_active is not None:
             update_data["is_active"] = is_active
-        
+
         update_data["updated_at"] = datetime.utcnow().isoformat()
-        
-        response = supabase.table("parking_slots")\
-            .update(update_data)\
-            .eq("id", slot_id)\
+
+        response = (
+            supabase.table("parking_slots")
+            .update(update_data)
+            .eq("id", slot_id)
             .execute()
-        
+        )
+
         if not response.data:
             raise HTTPException(status_code=404, detail="Parking slot not found")
-        
-        return {"slot": response.data[0], "message": "Parking slot updated successfully"}
+
+        return {
+            "slot": response.data[0],
+            "message": "Parking slot updated successfully",
+        }
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to update parking slot: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to update parking slot: {str(e)}"
+        )
 
 
 @app.delete("/api/v1/parking-slots/{slot_id}")
@@ -525,19 +572,23 @@ async def delete_parking_slot(slot_id: str):
     Delete a parking slot (soft delete by setting is_active to False).
     """
     try:
-        response = supabase.table("parking_slots")\
-            .update({"is_active": False, "updated_at": datetime.utcnow().isoformat()})\
-            .eq("id", slot_id)\
+        response = (
+            supabase.table("parking_slots")
+            .update({"is_active": False, "updated_at": datetime.utcnow().isoformat()})
+            .eq("id", slot_id)
             .execute()
-        
+        )
+
         if not response.data:
             raise HTTPException(status_code=404, detail="Parking slot not found")
-        
+
         return {"message": "Parking slot deleted successfully"}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete parking slot: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete parking slot: {str(e)}"
+        )
 
 
 @app.get("/api/v1/parking-slots/status")
@@ -551,84 +602,90 @@ async def get_parking_slots_status():
         # We'll use the parking-sessions endpoint logic to find active sessions
         fetch_limit = 1000
         try:
-            response = supabase.table("parking_events")\
-                .select("*")\
-                .order("created_at", desc=False)\
-                .limit(fetch_limit)\
+            response = (
+                supabase.table("parking_events")
+                .select("*")
+                .order("created_at", desc=False)
+                .limit(fetch_limit)
                 .execute()
-            
+            )
+
             events = response.data if response.data else []
         except Exception as db_error:
             # If database query fails, return empty slots
             events = []
             print(f"Database query error: {db_error}")
-        
+
         # Track active sessions by parking slot
-        slot_status = {}  # {slot_name: {occupied: bool, rfid_id: str, license_plate: str, time_in: str}}
+        slot_status = (
+            {}
+        )  # {slot_name: {occupied: bool, rfid_id: str, license_plate: str, time_in: str}}
         rfid_sessions = {}  # Track last IN event for each RFID
-        
+
         # Process events in chronological order to determine current occupancy
         for event in events:
-            rfid_id = event['rfid_id']
-            event_type = event.get('event_type')
-            parking_slot = event.get('parking_slot')
-            created_at = event['created_at']
-            
+            rfid_id = event["rfid_id"]
+            event_type = event.get("event_type")
+            parking_slot = event.get("parking_slot")
+            created_at = event["created_at"]
+
             if event_type is None:
-                event_type = 'IN'
-            
-            if event_type == 'IN':
+                event_type = "IN"
+
+            if event_type == "IN":
                 # If there's a previous session for this RFID, mark its slot as available
                 if rfid_id in rfid_sessions:
-                    prev_slot = rfid_sessions[rfid_id].get('parking_slot')
-                    if prev_slot and prev_slot != 'N/A':
+                    prev_slot = rfid_sessions[rfid_id].get("parking_slot")
+                    if prev_slot and prev_slot != "N/A":
                         if prev_slot in slot_status:
                             del slot_status[prev_slot]
-                
+
                 # Mark new slot as occupied
-                if parking_slot and parking_slot != 'N/A':
+                if parking_slot and parking_slot != "N/A":
                     slot_status[parking_slot] = {
-                        'occupied': True,
-                        'rfid_id': rfid_id,
-                        'license_plate': event.get('license_plate') or 'N/A',
-                        'time_in': created_at
+                        "occupied": True,
+                        "rfid_id": rfid_id,
+                        "license_plate": event.get("license_plate") or "N/A",
+                        "time_in": created_at,
                     }
-                
+
                 rfid_sessions[rfid_id] = {
-                    'parking_slot': parking_slot,
-                    'time_in': created_at
+                    "parking_slot": parking_slot,
+                    "time_in": created_at,
                 }
-            elif event_type == 'OUT':
+            elif event_type == "OUT":
                 # Mark slot as available
                 if rfid_id in rfid_sessions:
-                    prev_slot = rfid_sessions[rfid_id].get('parking_slot')
-                    if prev_slot and prev_slot != 'N/A':
+                    prev_slot = rfid_sessions[rfid_id].get("parking_slot")
+                    if prev_slot and prev_slot != "N/A":
                         if prev_slot in slot_status:
                             del slot_status[prev_slot]
                     del rfid_sessions[rfid_id]
-        
+
         # Get all parking slots from parking_slots table
         try:
-            slots_response = supabase.table("parking_slots")\
-                .select("*")\
-                .eq("is_active", True)\
-                .order("row_letter", desc=False)\
-                .order("slot_number", desc=False)\
+            slots_response = (
+                supabase.table("parking_slots")
+                .select("*")
+                .eq("is_active", True)
+                .order("row_letter", desc=False)
+                .order("slot_number", desc=False)
                 .execute()
-            
+            )
+
             all_slots = []
             if slots_response.data:
                 for slot in slots_response.data:
-                    all_slots.append(slot['slot_name'])
+                    all_slots.append(slot["slot_name"])
         except Exception as slots_error:
             # Fallback to default slots if parking_slots table doesn't exist or query fails
             print(f"Error fetching parking slots: {slots_error}, using default slots")
-            rows = ['A', 'B', 'C', 'D', 'E']
+            rows = ["A", "B", "C", "D", "E"]
             slots_per_row = 5
             for row in rows:
                 for slot_num in range(1, slots_per_row + 1):
                     all_slots.append(f"{row}{slot_num}")
-        
+
         # Create complete slot status map with all slots from database
         slot_map = {}
         for slot in all_slots:
@@ -636,18 +693,19 @@ async def get_parking_slots_status():
                 slot_map[slot] = slot_status[slot]
             else:
                 slot_map[slot] = {
-                    'occupied': False,
-                    'rfid_id': None,
-                    'license_plate': None,
-                    'time_in': None
+                    "occupied": False,
+                    "rfid_id": None,
+                    "license_plate": None,
+                    "time_in": None,
                 }
-        
+
         return {
             "slots": slot_map,
             "total_slots": len(slot_map),
-            "occupied_slots": sum(1 for s in slot_map.values() if s['occupied']),
-            "available_slots": sum(1 for s in slot_map.values() if not s['occupied'])
+            "occupied_slots": sum(1 for s in slot_map.values() if s["occupied"]),
+            "available_slots": sum(1 for s in slot_map.values() if not s["occupied"]),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch parking slot status: {str(e)}")
-
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch parking slot status: {str(e)}"
+        )

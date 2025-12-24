@@ -12,3 +12,4 @@ torchvision
 pillow 
 fast-alpr
 onnxruntime-gpu
+onnxruntime
