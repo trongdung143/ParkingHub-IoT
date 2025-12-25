@@ -103,7 +103,6 @@ def _pick_best_plate(alpr_results):
 
 
 def fastalpr_read_plate(alpr, pil_img, saved_path_str):
-    # 1) Normal prediction (path)
     try:
         res = alpr.predict(saved_path_str)
         text = _pick_best_plate(res)
@@ -152,7 +151,7 @@ async def health():
 
 
 @app.post("/api/v1/esp32/in-upload")
-async def esp32_upload(rfid_id: str = Query(...), request: Request = None):
+async def esp32_in_upload(rfid_id: str = Query(...), request: Request = None):
     """
     Endpoint for ESP32-CAM to upload RFID ID and license plate image.
 
@@ -208,10 +207,10 @@ async def esp32_upload(rfid_id: str = Query(...), request: Request = None):
                     plate_text = best.ocr.text.strip().replace(" ", "")
         except Exception as alpr_error:
             print(f"FastALPR failed: {alpr_error}")
-            plate_text = None
-            return
 
-        # Generate unique filename
+        if plate_text is None:
+            return {"suggested_slot": "NOT"}
+
         print("Detected plate text:", plate_text)
         original_name = "image.jpg"
         file_extension = original_name.split(".")[-1] if "." in original_name else "jpg"
@@ -338,6 +337,261 @@ async def esp32_upload(rfid_id: str = Query(...), request: Request = None):
             "suggested_slot": suggested_slot,
             "available_slots": available_slots,
         }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()  # debug
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/api/v1/esp32/out-upload")
+async def esp32_out_upload(rfid_id: str = Query(...), request: Request = None):
+    """
+    Endpoint for ESP32-CAM to upload RFID ID and license plate image for vehicle exit.
+    Validates that the vehicle has an active parking session and matches license plate.
+
+    Args:
+        rfid_id: RFID card ID as string
+        image: JPEG image file
+
+    Returns:
+        JSON with success status, or error if vehicle can't exit
+    """
+    try:
+        print(f"Received OUT upload for RFID ID: {rfid_id}")
+        # Read image bytes (keep original for Supabase upload)
+        image_bytes = await request.body()
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        BASE_DIR = Path(__file__).resolve().parent
+        DATA_DIR = BASE_DIR / "data"
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+        save_path = DATA_DIR / f"{rfid_id}_out.jpg"
+        img.save(save_path, format="JPEG", quality=95, optimize=True)
+
+        print("Saved OUT image to:", save_path)
+
+        # Detect license plate text using FastALPR
+        plate_text = None
+        try:
+            alpr_results = alpr.predict(str(save_path))
+
+            if alpr_results:
+
+                def score(r):
+                    if not r or not getattr(r, "ocr", None):
+                        return -1.0
+                    text = (getattr(r.ocr, "text", "") or "").strip().replace(" ", "")
+                    if not text:
+                        return -1.0
+
+                    ocr_conf = getattr(r.ocr, "confidence", None)
+                    ocr_conf = float(ocr_conf) if ocr_conf is not None else 0.0
+
+                    det_conf = 0.0
+                    if getattr(r, "detection", None) is not None:
+                        det_conf = float(getattr(r.detection, "confidence", 0.0) or 0.0)
+
+                    # prefer OCR confidence + longer strings (helps avoid missing last char)
+                    return (ocr_conf * 100.0) + (len(text) * 2.0) + det_conf
+
+                best = max(alpr_results, key=score)
+                if best and best.ocr and best.ocr.text:
+                    plate_text = best.ocr.text.strip().replace(" ", "")
+        except Exception as alpr_error:
+            print(f"FastALPR failed: {alpr_error}")
+
+        print("Detected plate text (OUT):", plate_text)
+
+        if plate_text is None:
+            return {"total_money": "NOT"}
+
+        # Find the most recent active IN event for this rfid_id
+        # An active session is one where the last event for this rfid_id is IN (not OUT)
+        try:
+            # Get all events for this rfid_id, ordered by created_at ascending (chronological)
+            events_resp = (
+                supabase.table("parking_events")
+                .select("*")
+                .eq("rfid_id", rfid_id)
+                .order("created_at", desc=False)
+                .execute()
+            )
+
+            events = events_resp.data or []
+            if not events:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No parking records found for this RFID ID. Vehicle cannot exit.",
+                )
+
+            # Process events chronologically to find the most recent active IN event
+            # Track the state: if last event is IN, we have an active session
+            active_in_event = None
+            for event in events:
+                event_type = event.get("event_type") or "IN"
+                if event_type == "IN":
+                    active_in_event = event
+                elif event_type == "OUT":
+                    # An OUT event closes the active session
+                    active_in_event = None
+
+            if not active_in_event:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No active parking session found. Vehicle cannot exit.",
+                )
+
+            # Get stored license plate from the IN event
+            stored_plate = active_in_event.get("license_plate")
+            stored_plate_clean = (
+                stored_plate.strip().replace(" ", "").upper() if stored_plate else None
+            )
+            detected_plate_clean = (
+                plate_text.strip().replace(" ", "").upper() if plate_text else None
+            )
+
+            # Compare detected license plate with stored license plate
+            if not detected_plate_clean:
+                return {"total_money": "NOT"}
+
+            if not stored_plate_clean:
+                # If stored plate is missing, allow exit but log warning
+                print(
+                    f"Warning: No stored license plate for RFID {rfid_id}, but allowing exit"
+                )
+            elif detected_plate_clean != stored_plate_clean:
+                return {"total_money": "NOT"}
+            # License plate matches (or stored is missing), proceed with OUT event
+            # Upload image to Supabase Storage
+            original_name = "image.jpg"
+            file_extension = (
+                original_name.split(".")[-1] if "." in original_name else "jpg"
+            )
+            filename = f"{uuid.uuid4()}.{file_extension}"
+            file_path = f"parking/{filename}"
+
+            try:
+                # Try to remove existing file first (if any) to avoid conflicts
+                try:
+                    supabase.storage.from_(SUPABASE_STORAGE_BUCKET).remove([file_path])
+                except:
+                    pass  # File doesn't exist, which is fine
+
+                # Upload the image
+                supabase.storage.from_(SUPABASE_STORAGE_BUCKET).upload(
+                    file_path, image_bytes, file_options={"content-type": "image/jpeg"}
+                )
+            except Exception as storage_error:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to upload image to storage: {str(storage_error)}",
+                )
+
+            # Get public URL for the image
+            try:
+                public_url_response = supabase.storage.from_(
+                    SUPABASE_STORAGE_BUCKET
+                ).get_public_url(file_path)
+                image_path = (
+                    public_url_response
+                    if isinstance(public_url_response, str)
+                    else file_path
+                )
+            except:
+                # Fallback to relative path if public URL fails
+                image_path = file_path
+
+            # Get parking slot from the IN event
+            parking_slot = active_in_event.get("parking_slot")
+
+            # Calculate total_money based on parking duration
+            # 1 minute = 10,000 VND
+            time_in_str = active_in_event.get("created_at")
+            time_out = datetime.utcnow()
+
+            total_money = None
+            if time_in_str:
+                try:
+                    # Parse time_in from ISO format string
+                    # Handle ISO format with or without timezone
+                    time_in_parsed = time_in_str
+                    if time_in_parsed.endswith("Z"):
+                        time_in_parsed = time_in_parsed[:-1] + "+00:00"
+                    elif "+" not in time_in_parsed and time_in_parsed.count("-") <= 2:
+                        # Naive datetime, assume UTC
+                        pass
+
+                    # Try parsing with timezone first
+                    try:
+                        time_in = datetime.fromisoformat(time_in_parsed)
+                        if time_in.tzinfo:
+                            # Convert to UTC naive datetime
+                            time_in = (time_in - time_in.utcoffset()).replace(
+                                tzinfo=None
+                            )
+                    except:
+                        # Fallback to naive datetime parsing
+                        time_in = datetime.fromisoformat(time_in_str.replace("Z", ""))
+
+                    # Calculate duration in minutes
+                    duration = time_out - time_in
+                    duration_minutes = max(
+                        0, duration.total_seconds() / 60.0
+                    )  # Ensure non-negative
+
+                    # Calculate total money: duration_minutes * 2000 VND
+                    # Round to 2 decimal places
+                    total_money = round(duration_minutes * 2000, 2)
+
+                    print(
+                        f"Parking duration: {duration_minutes:.2f} minutes, Total: {total_money:.2f} VND"
+                    )
+                except Exception as time_error:
+                    print(f"Error calculating parking duration: {time_error}")
+                    traceback.print_exc()
+                    total_money = None
+
+            # Insert OUT event into parking_events table
+            event_data = {
+                "id": str(uuid.uuid4()),
+                "rfid_id": rfid_id,
+                "image_path": image_path,
+                "created_at": datetime.utcnow().isoformat(),
+                "parking_slot": parking_slot,
+                "license_plate": plate_text,
+                "event_type": "OUT",
+                "total_money": total_money,
+            }
+
+            db_response = supabase.table("parking_events").insert(event_data).execute()
+
+            if not db_response.data:
+                raise HTTPException(
+                    status_code=500, detail="Failed to insert parking OUT event"
+                )
+
+            # Return success response
+            return {
+                "success": True,
+                "rfid_id": rfid_id,
+                "license_plate": plate_text,
+                "parking_slot": parking_slot,
+                "total_money": total_money,
+                "message": "Vehicle exit successful",
+            }
+
+        except HTTPException:
+            raise
+        except Exception as db_error:
+            print(f"Database error: {db_error}")
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database error: {str(db_error)}",
+            )
 
     except HTTPException:
         raise
